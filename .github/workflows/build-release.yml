@@ -204,3 +204,156 @@ jobs:
               || true
           fi
           gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # musl (Alpine) — full self-contained server bundle.
+  #
+  # moonshine-voice ships no musllinux wheel and no sdist, and its wheels bundle
+  # prebuilt glibc libmoonshine.so + libonnxruntime. moonshine_voice itself is
+  # pure Python (setup.py only packages whatever *.so sit in the package dir), so
+  # the musl path builds the native libs from source and assembles the package by
+  # hand, then freezes it exactly like the glibc build:
+  #   1. link the Alpine-packaged musl onnxruntime (no ~40min ORT source build),
+  #   2. cmake-build core/ -> libmoonshine.so,
+  #   3. drop libmoonshine.so + libonnxruntime into the moonshine_voice package,
+  #   4. pip install it (deps minus sounddevice) + PyInstaller-freeze main.py,
+  #   5. publish moonshine-server-<tag>-linux-musl-<arch>.tar.gz to the release.
+  # ══════════════════════════════════════════════════════════════════════════
+  build-musl:
+    name: Build (${{ matrix.plat }})
+    needs: check
+    # Opt-in on manual dispatch only, so the daily scheduled run keeps publishing
+    # just the glibc/win/mac assets (unchanged) while the musl bundle is still
+    # stabilizing. Drop the event_name check to auto-publish musl on schedule too
+    # once it's reliably green.
+    if: github.event_name == 'workflow_dispatch' && needs.check.outputs.need_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+            plat: linux-musl-x64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            plat: linux-musl-arm64
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAG: ${{ needs.check.outputs.tag }}
+      PLAT: ${{ matrix.plat }}
+      LEMONADE_REF: ${{ github.event.inputs.lemonade_ref || 'main' }}
+    steps:
+      - name: Build self-contained musl bundle (Alpine / PyInstaller)
+        run: |
+          # Pinned to alpine 3.23: it ships Python 3.12 (the wrapper's main.py
+          # imports cgi, removed from the stdlib in 3.13) AND onnxruntime. alpine:latest
+          # moved to Python 3.14, which breaks the bundle at runtime.
+          docker run --rm \
+            -e ARCH=${{ matrix.arch }} -e VERSION -e TAG -e PLAT -e LEMONADE_REF \
+            -v "$PWD:/out" alpine:3.23 sh -euxc '
+            # build-base/python3-dev/zlib-dev: PyInstaller has no musllinux wheel,
+            # so pip compiles its bootloader from the sdist here.
+            apk add --no-cache build-base cmake git git-lfs bash samurai patchelf \
+              onnxruntime onnxruntime-dev python3 python3-dev py3-pip py3-numpy \
+              zlib-dev curl
+            git lfs install --skip-repo
+
+            # 1. moonshine core, pinned to the tag matching the packaged
+            # moonshine-voice version so the musl libmoonshine.so has the same C ABI
+            # as the glibc .so the wheel bundles. Some sources (e.g. the zipvoice TTS
+            # voice data) are Git LFS pointers — pull them or they compile as the
+            # literal pointer text. + drop the system musl ORT over the vendored glibc one.
+            git clone --depth 1 --branch "v${VERSION}" \
+              https://github.com/moonshine-ai/moonshine
+            git -C moonshine lfs pull
+            DEST=moonshine/core/third-party/onnxruntime/lib/linux/${ARCH}
+            mkdir -p "$DEST"
+            cp -L /usr/lib/libonnxruntime.so.1 "$DEST/libonnxruntime.so.1"
+
+            # 2. Build the C++ core. musl + modern gcc: moonshine headers use
+            # int32_t/int64_t without #include <cstdint> (e.g. moonshine-utils/
+            # string-utils.h, spelling-fusion-data.h). Force-include it into every
+            # C++ TU (CMake seeds CMAKE_CXX_FLAGS from CXXFLAGS).
+            export CXXFLAGS="-include cstdint"
+            cmake -S moonshine/core -B moonshine/core/build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+              -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+            cmake --build moonshine/core/build -j"$(nproc)"
+
+            # 3. Assemble the moonshine_voice package: drop our musl libmoonshine.so
+            # (+ its sibling libonnxruntime) where package_data globs *.so and the
+            # loader searches first ($__file__.parent). $ORIGIN rpath so libmoonshine
+            # finds libonnxruntime next to it.
+            PKG=moonshine/python/src/moonshine_voice
+            find moonshine/core/build -name libmoonshine.so -exec cp {} "$PKG/" \;
+            cp -L /usr/lib/libonnxruntime.so.1 "$PKG/"
+            patchelf --set-rpath "\$ORIGIN" "$PKG/libmoonshine.so"
+
+            # musl has no libc.so.6; ctypes.util.find_library("c") returns None on
+            # Alpine, so the upstream fallback CDLL("libc.so.6") throws. CDLL(None)
+            # resolves free() from the process-global symbols on glibc and musl alike.
+            sed -i "s|return ctypes.CDLL(\"libc.so.6\")|return ctypes.CDLL(None)  # musl: no libc.so.6|" \
+              "$PKG/moonshine_api.py"
+
+            # 4. Install moonshine_voice + only the deps the transcription server
+            # uses. --no-deps skips sounddevice (mic/TTS only; needs PortAudio/cffi),
+            # which the server never imports.
+            pip install --break-system-packages --no-cache-dir --upgrade pip
+            pip install --break-system-packages --no-cache-dir ./moonshine/python --no-deps
+            # numpy comes from apk (py3-numpy) — the pip musllinux wheel vendors
+            # hash-named libstdc++/libgcc that PyInstaller lib-flattening breaks.
+            # (Keep apostrophes out of this block: it is a single-quoted sh -c script,
+            # so a stray apostrophe would close the quote and leak the rest to the host.)
+            pip install --break-system-packages --no-cache-dir \
+              requests tqdm filelock platformdirs websockets pyinstaller
+            # Fail fast (with the real error) if the package or its runtime deps are
+            # not importable, instead of letting --collect-all silently bundle nothing.
+            python3 -c "import moonshine_voice; print(moonshine_voice.__file__)"
+
+            # 5. lemonade wrapper (same main.py the glibc bundles).
+            mkdir -p wrapper
+            curl -fsSL \
+              "https://raw.githubusercontent.com/lemonade-sdk/lemonade/${LEMONADE_REF}/tools/moonshine-server/main.py" \
+              -o wrapper/main.py
+
+            # 6. Freeze. Exclude sounddevice so PyInstaller does not choke on the
+            # unused mic/TTS import chain.
+            pyinstaller --noconfirm --onedir --name moonshine-server \
+              --paths moonshine/python/src \
+              --collect-all moonshine_voice \
+              --hidden-import websockets \
+              --exclude-module sounddevice \
+              wrapper/main.py
+
+            ./dist/moonshine-server/moonshine-server --help
+
+            cp -r dist /out/dist
+            chmod -R a+rwX /out/dist
+          '
+
+      - name: Package asset (name must match get_install_params)
+        id: package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ASSET="moonshine-server-${TAG}-${PLAT}.tar.gz"
+          tar -C dist -czf "$ASSET" moonshine-server
+          ls -lh "$ASSET"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          ASSET="${{ steps.package.outputs.asset }}"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "moonshine-server $TAG" \
+              --notes "Self-contained moonshine-server bundles (PyInstaller, embedded Python 3.12 + moonshine-voice ${VERSION}). Wrapper: lemonade-sdk/lemonade tools/moonshine-server/main.py." \
+              || true
+          fi
+          gh release upload "$TAG" "$ASSET" --repo "$GITHUB_REPOSITORY" --clobber
